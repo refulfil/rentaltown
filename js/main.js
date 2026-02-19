@@ -151,8 +151,8 @@ registerShop({
 registerShop({
   buttonText: 'RENT CAMPER',
   clusterName: 'factory',
-  localX: 18, localZ: 0,
-  canShow: function () { return simCharacter && !simCharacter.userData.onBike && !simCharacter.userData.onCamper; },
+  localX: 18, localZ: 5,
+  canShow: function () { return simCharacter && !simCharacter.userData.onCamper; },
   onRent: function () { mountCamper(); },
 });
 
@@ -325,10 +325,8 @@ function main() {
       var target = hits[0].point;
 
       if (simCharacter.userData.onCamper) {
-        // Snap target to nearest road and use pathfinding
-        var roadTarget = getNearestRoadPoint(target.x, target.z);
-        var path = findRoadPath(simCharacter.position.x, simCharacter.position.z, roadTarget.x, roadTarget.z);
-        var waypoints = pathToLaneWaypoints(path);
+        // Compute road waypoints using L-shaped routing
+        var waypoints = computeCamperWaypoints(simCharacter.position.x, simCharacter.position.z, target.x, target.z);
         simCharacter.userData.camperPath = waypoints;
         simCharacter.userData.camperPathIdx = 0;
 
@@ -390,6 +388,7 @@ function main() {
       if (simCharacter) {
         simCharacter.position.x -= LEAP;
         if (simCharacter.userData.targetX !== null) simCharacter.userData.targetX -= LEAP;
+        if (simCharacter.userData.camperPath) simCharacter.userData.camperPath.forEach(function (wp) { wp.x -= LEAP; });
       }
     } else if (camera.position.x < -120) {
       controls.target.x += LEAP;
@@ -398,6 +397,7 @@ function main() {
       if (simCharacter) {
         simCharacter.position.x += LEAP;
         if (simCharacter.userData.targetX !== null) simCharacter.userData.targetX += LEAP;
+        if (simCharacter.userData.camperPath) simCharacter.userData.camperPath.forEach(function (wp) { wp.x += LEAP; });
       }
     }
     if (camera.position.z > 130) {
@@ -407,6 +407,7 @@ function main() {
       if (simCharacter) {
         simCharacter.position.z -= LEAP;
         if (simCharacter.userData.targetZ !== null) simCharacter.userData.targetZ -= LEAP;
+        if (simCharacter.userData.camperPath) simCharacter.userData.camperPath.forEach(function (wp) { wp.z -= LEAP; });
       }
     } else if (camera.position.z < -120) {
       controls.target.z += LEAP;
@@ -415,12 +416,16 @@ function main() {
       if (simCharacter) {
         simCharacter.position.z += LEAP;
         if (simCharacter.userData.targetZ !== null) simCharacter.userData.targetZ += LEAP;
+        if (simCharacter.userData.camperPath) simCharacter.userData.camperPath.forEach(function (wp) { wp.z += LEAP; });
       }
     }
 
     raycaster.setFromCamera(mouse, camera);
 
     carList.forEach((car) => {
+      // Skip camper proxy from self-driving
+      if (car.isCamperProxy) return;
+
       car.r.set(
         new THREE.Vector3(car.position.x + 58, 1, car.position.z),
         new THREE.Vector3(car.userData.x, 0, car.userData.z)
@@ -437,7 +442,10 @@ function main() {
           var ndz = car.userData.z / dirLen;
           var forward = toSimX * ndx + toSimZ * ndz;
           var perp = Math.abs(toSimX * ndz - toSimZ * ndx);
-          simBlocking = forward > 0 && forward < 12 && perp < 3;
+          // Larger blocking area when sim is in a camper
+          var blockFwd = (simCharacter.userData.onCamper) ? 18 : 12;
+          var blockPerp = (simCharacter.userData.onCamper) ? 5 : 3;
+          simBlocking = forward > 0 && forward < blockFwd && perp < blockPerp;
         }
       }
       if (_NT.length > 0 || simBlocking) {
@@ -499,9 +507,12 @@ function main() {
       }
     });
 
-    // Show/hide dismount button
+    // Show/hide dismount buttons
     if (dismountBikeBtn) {
       dismountBikeBtn.style.display = (simCharacter && simCharacter.userData.onBike) ? 'block' : 'none';
+    }
+    if (dismountCamperBtn) {
+      dismountCamperBtn.style.display = (simCharacter && simCharacter.userData.onCamper) ? 'block' : 'none';
     }
 
     renderer.render(scene, camera);
@@ -761,11 +772,13 @@ function dismountBike() {
 
 // --- Road network for camper pathfinding ---
 var ROAD_SPACING = 60;
+var ROAD_OFFSET_X = -26;
+var ROAD_OFFSET_Z = -13;
 var LANE_OFFSET = 3;
 
 function getNearestRoadPoint(wx, wz) {
-  var nearestNSx = Math.round(wx / ROAD_SPACING) * ROAD_SPACING;
-  var nearestEWz = Math.round(wz / ROAD_SPACING) * ROAD_SPACING;
+  var nearestNSx = Math.round((wx - ROAD_OFFSET_X) / ROAD_SPACING) * ROAD_SPACING + ROAD_OFFSET_X;
+  var nearestEWz = Math.round((wz - ROAD_OFFSET_Z) / ROAD_SPACING) * ROAD_SPACING + ROAD_OFFSET_Z;
   var distToNS = Math.abs(wx - nearestNSx);
   var distToEW = Math.abs(wz - nearestEWz);
   if (distToNS < distToEW) {
@@ -775,108 +788,99 @@ function getNearestRoadPoint(wx, wz) {
   }
 }
 
-function getNearestIntersection(wx, wz) {
-  return {
-    x: Math.round(wx / ROAD_SPACING) * ROAD_SPACING,
-    z: Math.round(wz / ROAD_SPACING) * ROAD_SPACING,
-  };
-}
+// L-shaped road routing with proper lane offsets
+function computeCamperWaypoints(startX, startZ, targetX, targetZ) {
+  // Which road is the start on?
+  var sNSx = Math.round((startX - ROAD_OFFSET_X) / ROAD_SPACING) * ROAD_SPACING + ROAD_OFFSET_X;
+  var sEWz = Math.round((startZ - ROAD_OFFSET_Z) / ROAD_SPACING) * ROAD_SPACING + ROAD_OFFSET_Z;
+  var startOnNS = Math.abs(startX - sNSx) <= Math.abs(startZ - sEWz);
 
-function findRoadPath(startX, startZ, endX, endZ) {
-  var start = getNearestIntersection(startX, startZ);
-  var end = getNearestIntersection(endX, endZ);
-
-  if (start.x === end.x && start.z === end.z) {
-    return [{ x: end.x, z: end.z }];
-  }
-
-  var openSet = [{ x: start.x, z: start.z, g: 0, f: 0, parent: null }];
-  var closedSet = {};
-
-  function key(x, z) { return x + ',' + z; }
-  function heuristic(x1, z1, x2, z2) {
-    return Math.abs(x1 - x2) + Math.abs(z1 - z2);
-  }
-
-  var endKey = key(end.x, end.z);
-
-  while (openSet.length > 0) {
-    var bestIdx = 0;
-    for (var i = 1; i < openSet.length; i++) {
-      if (openSet[i].f < openSet[bestIdx].f) bestIdx = i;
-    }
-    var current = openSet[bestIdx];
-
-    if (key(current.x, current.z) === endKey) {
-      var path = [];
-      var node = current;
-      while (node) {
-        path.unshift({ x: node.x, z: node.z });
-        node = node.parent;
-      }
-      return path;
-    }
-
-    openSet.splice(bestIdx, 1);
-    closedSet[key(current.x, current.z)] = true;
-
-    var neighbors = [
-      { x: current.x + ROAD_SPACING, z: current.z },
-      { x: current.x - ROAD_SPACING, z: current.z },
-      { x: current.x, z: current.z + ROAD_SPACING },
-      { x: current.x, z: current.z - ROAD_SPACING },
-    ];
-
-    for (var ni = 0; ni < neighbors.length; ni++) {
-      var n = neighbors[ni];
-      var nKey = key(n.x, n.z);
-      if (closedSet[nKey]) continue;
-
-      var g = current.g + ROAD_SPACING;
-      var f = g + heuristic(n.x, n.z, end.x, end.z);
-
-      var existing = null;
-      for (var oi = 0; oi < openSet.length; oi++) {
-        if (key(openSet[oi].x, openSet[oi].z) === nKey) {
-          existing = openSet[oi];
-          break;
-        }
-      }
-
-      if (!existing) {
-        openSet.push({ x: n.x, z: n.z, g: g, f: f, parent: current });
-      } else if (g < existing.g) {
-        existing.g = g;
-        existing.f = f;
-        existing.parent = current;
-      }
-    }
-
-    if (Object.keys(closedSet).length > 500) break;
-  }
-
-  return [{ x: start.x, z: start.z }, { x: end.x, z: end.z }];
-}
-
-function pathToLaneWaypoints(path) {
-  if (path.length < 2) return path;
+  // Which road is the target closest to?
+  var tNSx = Math.round((targetX - ROAD_OFFSET_X) / ROAD_SPACING) * ROAD_SPACING + ROAD_OFFSET_X;
+  var tEWz = Math.round((targetZ - ROAD_OFFSET_Z) / ROAD_SPACING) * ROAD_SPACING + ROAD_OFFSET_Z;
+  var targetOnNS = Math.abs(targetX - tNSx) <= Math.abs(targetZ - tEWz);
 
   var waypoints = [];
-  for (var i = 0; i < path.length - 1; i++) {
-    var from = path[i];
-    var to = path[i + 1];
-    var dx = to.x - from.x;
-    var dz = to.z - from.z;
 
-    // Lane offset for right-hand traffic
-    var laneX = 0, laneZ = 0;
-    if (dx > 0) laneZ = -LANE_OFFSET;       // eastbound: south side
-    else if (dx < 0) laneZ = LANE_OFFSET;   // westbound: north side
-    else if (dz > 0) laneX = LANE_OFFSET;   // north(+z): east side
-    else if (dz < 0) laneX = -LANE_OFFSET;  // south(-z): west side
+  if (startOnNS && !targetOnNS) {
+    // Start on N-S road, target on E-W road: L-shape
+    var dz = tEWz - startZ;
+    var nsLane = dz >= 0 ? LANE_OFFSET : -LANE_OFFSET;
+    waypoints.push({ x: sNSx + nsLane, z: tEWz });
+    var dx = targetX - sNSx;
+    if (Math.abs(dx) > 2) {
+      var ewLane = dx >= 0 ? -LANE_OFFSET : LANE_OFFSET;
+      waypoints.push({ x: targetX, z: tEWz + ewLane });
+    }
 
-    waypoints.push({ x: from.x + laneX, z: from.z + laneZ });
-    waypoints.push({ x: to.x + laneX, z: to.z + laneZ });
+  } else if (!startOnNS && targetOnNS) {
+    // Start on E-W road, target on N-S road: L-shape
+    var dx = tNSx - startX;
+    var ewLane = dx >= 0 ? -LANE_OFFSET : LANE_OFFSET;
+    waypoints.push({ x: tNSx, z: sEWz + ewLane });
+    var dz = targetZ - sEWz;
+    if (Math.abs(dz) > 2) {
+      var nsLane = dz >= 0 ? LANE_OFFSET : -LANE_OFFSET;
+      waypoints.push({ x: tNSx + nsLane, z: targetZ });
+    }
+
+  } else if (startOnNS && targetOnNS) {
+    // Both on N-S roads
+    if (sNSx === tNSx) {
+      // Same road — straight line
+      var dz = targetZ - startZ;
+      var nsLane = dz >= 0 ? LANE_OFFSET : -LANE_OFFSET;
+      waypoints.push({ x: sNSx + nsLane, z: targetZ });
+    } else {
+      // Different N-S roads — Z-shape via E-W connector
+      var floorZ = Math.floor((startZ - ROAD_OFFSET_Z) / ROAD_SPACING) * ROAD_SPACING + ROAD_OFFSET_Z;
+      var ceilZ = Math.ceil((startZ - ROAD_OFFSET_Z) / ROAD_SPACING) * ROAD_SPACING + ROAD_OFFSET_Z;
+      if (floorZ === ceilZ) ceilZ += ROAD_SPACING;
+      var connectZ = (Math.abs(floorZ - targetZ) < Math.abs(ceilZ - targetZ)) ? floorZ : ceilZ;
+
+      var dz1 = connectZ - startZ;
+      if (Math.abs(dz1) > 1) {
+        var nsLane1 = dz1 >= 0 ? LANE_OFFSET : -LANE_OFFSET;
+        waypoints.push({ x: sNSx + nsLane1, z: connectZ });
+      }
+      var dx = tNSx - sNSx;
+      var ewLane = dx >= 0 ? -LANE_OFFSET : LANE_OFFSET;
+      waypoints.push({ x: tNSx, z: connectZ + ewLane });
+      var dz2 = targetZ - connectZ;
+      if (Math.abs(dz2) > 1) {
+        var nsLane2 = dz2 >= 0 ? LANE_OFFSET : -LANE_OFFSET;
+        waypoints.push({ x: tNSx + nsLane2, z: targetZ });
+      }
+    }
+
+  } else {
+    // Both on E-W roads
+    if (sEWz === tEWz) {
+      // Same road — straight line
+      var dx = targetX - startX;
+      var ewLane = dx >= 0 ? -LANE_OFFSET : LANE_OFFSET;
+      waypoints.push({ x: targetX, z: sEWz + ewLane });
+    } else {
+      // Different E-W roads — Z-shape via N-S connector
+      var floorX = Math.floor(startX / ROAD_SPACING) * ROAD_SPACING;
+      var ceilX = Math.ceil(startX / ROAD_SPACING) * ROAD_SPACING;
+      if (floorX === ceilX) ceilX += ROAD_SPACING;
+      var connectX = (Math.abs(floorX - targetX) < Math.abs(ceilX - targetX)) ? floorX : ceilX;
+
+      var dx1 = connectX - startX;
+      if (Math.abs(dx1) > 1) {
+        var ewLane1 = dx1 >= 0 ? -LANE_OFFSET : LANE_OFFSET;
+        waypoints.push({ x: connectX, z: sEWz + ewLane1 });
+      }
+      var dz = tEWz - sEWz;
+      var nsLane = dz >= 0 ? LANE_OFFSET : -LANE_OFFSET;
+      waypoints.push({ x: connectX + nsLane, z: tEWz });
+      var dx2 = targetX - connectX;
+      if (Math.abs(dx2) > 1) {
+        var ewLane2 = dx2 >= 0 ? -LANE_OFFSET : LANE_OFFSET;
+        waypoints.push({ x: targetX, z: tEWz + ewLane2 });
+      }
+    }
   }
 
   return waypoints;
@@ -888,6 +892,11 @@ function mountCamper() {
   var ud = simCharacter.userData;
 
   if (ud.onBike) dismountBike();
+
+  // Snap character to nearest road so the camper doesn't spawn inside a building
+  var roadSnap = getNearestRoadPoint(simCharacter.position.x, simCharacter.position.z);
+  simCharacter.position.x = roadSnap.x;
+  simCharacter.position.z = roadSnap.z;
 
   var camper = createCampervan(0x2980b9);
   camper.position.set(0, 0.2, 0);
@@ -1064,7 +1073,13 @@ function updateSimsCharacter() {
 
   // Animate R logo (spin + bob)
   ud.rLogo.rotation.y += 0.03;
-  ud.rLogo.position.y = 2.8 + Math.sin(Date.now() * 0.003) * 0.15;
+  var logoBaseY = ud.onCamper ? 4.5 : 2.8;
+  ud.rLogo.position.y = logoBaseY + Math.sin(Date.now() * 0.003) * 0.15;
+
+  // Sync camper proxy position
+  if (ud.camperProxy) {
+    ud.camperProxy.position.copy(simCharacter.position);
+  }
 
   if (!ud.isWalking || ud.targetX === null) return;
 
@@ -1073,17 +1088,30 @@ function updateSimsCharacter() {
   var dist = Math.sqrt(dx * dx + dz * dz);
 
   if (dist < 0.5) {
-    // Arrived at target
+    // Check for more camper waypoints
+    if (ud.onCamper && ud.camperPath.length > 0 && ud.camperPathIdx < ud.camperPath.length - 1) {
+      ud.camperPathIdx++;
+      var wp = ud.camperPath[ud.camperPathIdx];
+      ud.targetX = wp.x;
+      ud.targetZ = wp.z;
+      var ndx = wp.x - simCharacter.position.x;
+      var ndz = wp.z - simCharacter.position.z;
+      if (Math.abs(ndx) > 0.01 || Math.abs(ndz) > 0.01) {
+        simCharacter.rotation.y = Math.atan2(ndx, ndz);
+      }
+      return;
+    }
+
+    // Arrived at final target
     ud.isWalking = false;
     ud.targetX = null;
     ud.targetZ = null;
     if (ud.onBike) {
-      // Hold riding pose when stopped
       ud.leftArmPivot.rotation.x = -0.8;
       ud.rightArmPivot.rotation.x = -0.8;
       ud.leftLegPivot.rotation.x = -0.3;
       ud.rightLegPivot.rotation.x = -0.3;
-    } else {
+    } else if (!ud.onCamper) {
       ud.leftArmPivot.rotation.x = 0;
       ud.rightArmPivot.rotation.x = 0;
       ud.leftLegPivot.rotation.x = 0;
@@ -1092,58 +1120,65 @@ function updateSimsCharacter() {
     return;
   }
 
-  // Collect obstacles for raycasting (everything except ground, character, lights)
-  var obstacles = [];
-  scene.children.forEach(function (obj) {
-    if (obj !== groundPlane && obj !== simCharacter) {
-      obstacles.push(obj);
-    }
-  });
-
   var desiredAngle = Math.atan2(dx, dz);
-  var charPos = new THREE.Vector3(simCharacter.position.x, 1.0, simCharacter.position.z);
-  var checkDist = 6;
 
-  // Try the direct path first, then increasingly wider angles to steer around obstacles
-  var offsets = [0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05, 1.4, -1.4];
-  var moveAngle = null;
+  if (ud.onCamper) {
+    // Camper drives straight toward waypoint (on roads, no obstacle avoidance)
+    simCharacter.position.x += Math.sin(desiredAngle) * ud.speed;
+    simCharacter.position.z += Math.cos(desiredAngle) * ud.speed;
+    simCharacter.rotation.y = desiredAngle;
+  } else {
+    // Collect obstacles for raycasting (everything except ground, character, lights)
+    var obstacles = [];
+    scene.children.forEach(function (obj) {
+      if (obj !== groundPlane && obj !== simCharacter) {
+        obstacles.push(obj);
+      }
+    });
 
-  for (var i = 0; i < offsets.length; i++) {
-    var angle = desiredAngle + offsets[i];
-    var dir = new THREE.Vector3(Math.sin(angle), 0, Math.cos(angle));
-    var ray = new THREE.Raycaster(charPos, dir, 0, checkDist);
-    var hits = ray.intersectObjects(obstacles, true);
-    if (hits.length === 0) {
-      moveAngle = angle;
-      break;
+    var charPos = new THREE.Vector3(simCharacter.position.x, 1.0, simCharacter.position.z);
+    var checkDist = 6;
+
+    // Try the direct path first, then increasingly wider angles to steer around obstacles
+    var offsets = [0, 0.35, -0.35, 0.7, -0.7, 1.05, -1.05, 1.4, -1.4];
+    var moveAngle = null;
+
+    for (var i = 0; i < offsets.length; i++) {
+      var angle = desiredAngle + offsets[i];
+      var dir = new THREE.Vector3(Math.sin(angle), 0, Math.cos(angle));
+      var ray = new THREE.Raycaster(charPos, dir, 0, checkDist);
+      var hits = ray.intersectObjects(obstacles, true);
+      if (hits.length === 0) {
+        moveAngle = angle;
+        break;
+      }
     }
-  }
 
-  if (moveAngle !== null) {
-    simCharacter.position.x += Math.sin(moveAngle) * ud.speed;
-    simCharacter.position.z += Math.cos(moveAngle) * ud.speed;
-    simCharacter.rotation.y = moveAngle;
+    if (moveAngle !== null) {
+      simCharacter.position.x += Math.sin(moveAngle) * ud.speed;
+      simCharacter.position.z += Math.cos(moveAngle) * ud.speed;
+      simCharacter.rotation.y = moveAngle;
 
-    if (ud.onBike) {
-      // Pedaling animation — circular leg motion
-      ud.animPhase += 0.18;
-      var pedalAngle = ud.animPhase;
-      ud.leftLegPivot.rotation.x = -0.3 + Math.sin(pedalAngle) * 0.5;
-      ud.rightLegPivot.rotation.x = -0.3 + Math.sin(pedalAngle + Math.PI) * 0.5;
-      // Arms stay fixed gripping handlebars
-      ud.leftArmPivot.rotation.x = -0.8;
-      ud.rightArmPivot.rotation.x = -0.8;
-    } else {
-      // Walk animation
-      ud.animPhase += 0.12;
-      var swing = Math.sin(ud.animPhase) * 0.6;
-      ud.leftArmPivot.rotation.x = swing;
-      ud.rightArmPivot.rotation.x = -swing;
-      ud.leftLegPivot.rotation.x = -swing;
-      ud.rightLegPivot.rotation.x = swing;
+      if (ud.onBike) {
+        // Pedaling animation
+        ud.animPhase += 0.18;
+        var pedalAngle = ud.animPhase;
+        ud.leftLegPivot.rotation.x = -0.3 + Math.sin(pedalAngle) * 0.5;
+        ud.rightLegPivot.rotation.x = -0.3 + Math.sin(pedalAngle + Math.PI) * 0.5;
+        ud.leftArmPivot.rotation.x = -0.8;
+        ud.rightArmPivot.rotation.x = -0.8;
+      } else {
+        // Walk animation
+        ud.animPhase += 0.12;
+        var swing = Math.sin(ud.animPhase) * 0.6;
+        ud.leftArmPivot.rotation.x = swing;
+        ud.rightArmPivot.rotation.x = -swing;
+        ud.leftLegPivot.rotation.x = -swing;
+        ud.rightLegPivot.rotation.x = swing;
+      }
     }
+    // If all directions blocked, character waits until a path opens
   }
-  // If all directions blocked, character waits until a path opens
 }
 
 function createBicycle(color) {

@@ -549,18 +549,6 @@ function main() {
   }
   requestAnimationFrame(render);
 
-  {
-    document
-      .getElementById('about-button')
-      .addEventListener('click', function (e) {
-        isPlaying = !isPlaying;
-        if (isPlaying) {
-          requestAnimationFrame(render);
-        }
-        document.getElementById('about').classList.toggle('visible');
-        document.getElementById('c').classList.toggle('blur');
-      });
-  }
 }
 
 main();
